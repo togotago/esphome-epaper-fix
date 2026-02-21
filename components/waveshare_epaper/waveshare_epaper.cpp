@@ -2455,86 +2455,103 @@ void GDEY042T81::update_part_() {
 }
 
 void HOT GDEY042T81::display() {
-  ESP_LOGD(TAG, "Wake up the display");
-  this->init_display_();
+  // For full updates: full init + deep sleep after (standard behavior)
+  // For partial updates: lightweight init, NO hardware reset, NO deep sleep
+  // This preserves the controller's buffer state between partial refreshes.
+  // GxEPD2 follows the same pattern: _Init_Part() only sets up registers
+  // without clearing RAM, and doesn't deep sleep between partial updates.
+
+  if (this->full_update_every_ == 1) {
+    // Single full update mode — standard behavior
+    this->init_display_();
+    if (!this->wait_until_idle_()) {
+      this->status_set_warning();
+      return;
+    }
+    ESP_LOGD(TAG, "Full update");
+    this->command(0x24);
+    this->start_data_();
+    this->write_array(this->buffer_, this->get_buffer_length_());
+    this->end_data_();
+    this->update_full_();
+    return;
+  }
+
+  if (this->at_update_ == 0) {
+    // Periodic full update — full init, write both buffers, deep sleep after
+    this->init_display_();
+    if (!this->wait_until_idle_()) {
+      this->status_set_warning();
+      return;
+    }
+    ESP_LOGD(TAG, "Full update (periodic)");
+    this->command(0x24);
+    this->start_data_();
+    this->write_array(this->buffer_, this->get_buffer_length_());
+    this->end_data_();
+
+    this->command(0x26);
+    this->start_data_();
+    this->write_array(this->buffer_, this->get_buffer_length_());
+    this->end_data_();
+
+    this->update_full_();
+    this->at_update_ = (this->at_update_ + 1) % this->full_update_every_;
+    this->wait_until_idle_();
+    // Don't deep sleep after full update if next will be partial
+    // The controller needs to stay awake to retain buffer state
+    return;
+  }
+
+  // Partial update — NO hardware reset, NO SWRESET, NO deep sleep
+  ESP_LOGD(TAG, "Partial update");
+
+  // Lightweight init: just set up RAM addressing without resetting
+  // (matches GxEPD2's _Init_Part which only writes registers)
+  this->command(0x3C);  // BorderWaveform
+  this->data(0x01);
+  this->command(0x18);  // Read built-in temperature sensor
+  this->data(0x80);
+
+  this->command(0x11);  // data entry mode
+  this->data(0x03);
+  this->command(0x44);  // set Ram-X address start/end
+  this->data(0);
+  this->data(0x31);
+  this->command(0x45);  // set Ram-Y address start/end
+  this->data(0);
+  this->data(0);
+  this->data(0x2B);
+  this->data(0x01);
+  this->command(0x4E);  // set RAM x address count
+  this->data(0);
+  this->command(0x4F);  // set RAM y address count
+  this->data(0);
+  this->data(0);
 
   if (!this->wait_until_idle_()) {
     this->status_set_warning();
-    ESP_LOGE(TAG, "Failed to perform update, display is busy");
     return;
   }
 
-  // basic code structure copied from WaveshareEPaper2P9InV2R2
-  if (this->full_update_every_ == 1) {
-    ESP_LOGD(TAG, "Full update");
-    // do single full update
-    this->command(0x24);
-    this->start_data_();
-    this->write_array(this->buffer_, this->get_buffer_length_());
-    this->end_data_();
+  // Write new image to current buffer
+  this->command(0x24);
+  this->start_data_();
+  this->write_array(this->buffer_, this->get_buffer_length_());
+  this->end_data_();
 
-    // TurnOnDisplay
-    this->update_full_();
-    return;
-  }
+  // Perform partial refresh
+  this->update_part_();
+  this->wait_until_idle_();
 
-  // if (this->full_update_every_ == 1 ||
-  if (this->at_update_ == 0) {
-    ESP_LOGD(TAG, "Update");
-    // do base update
-    this->command(0x24);
-    this->start_data_();
-    this->write_array(this->buffer_, this->get_buffer_length_());
-    this->end_data_();
-
-    this->command(0x26);
-    this->start_data_();
-    this->write_array(this->buffer_, this->get_buffer_length_());
-    this->end_data_();
-
-    // TurnOnDisplay;
-    this->update_full_();
-  } else {
-    // do partial update (full screen)
-    // no need to load a LUT for GoodDisplays as they seem to have the LUT onboard
-    // GD example code (Display_EPD_W21.cpp@283ff)
-    //
-    // not setting the BorderWaveform here again (contrary to the GD example) because according to
-    // https://github.com/ZinggJM/GxEPD2/blob/03d8e7a533c1493f762e392ead12f1bcb7fab8f9/src/gdey/GxEPD2_420_GDEY042T81.cpp#L358
-    // it seems to be enough to set it during display initialization
-    ESP_LOGD(TAG, "Partial update");
-    this->reset_();
-    if (!this->wait_until_idle_()) {
-      this->status_set_warning();
-      ESP_LOGE(TAG, "Failed to perform partial update, display is busy");
-      return;
-    }
-
-    this->command(0x24);
-    this->start_data_();
-    this->write_array(this->buffer_, this->get_buffer_length_());
-    this->end_data_();
-
-    // TurnOnDisplay
-    this->update_part_();
-
-    // BUGFIX: Copy current buffer to previous buffer after partial refresh.
-    // The SSD1683 uses the diff between 0x24 (current) and 0x26 (previous)
-    // to determine which pixels changed. Without this, subsequent partial
-    // refreshes produce ghosting/garbling because the controller doesn't
-    // know what the screen currently shows.
-    // Reference: GxEPD2's writeImageAgain() does exactly this.
-    this->wait_until_idle_();
-    this->command(0x26);
-    this->start_data_();
-    this->write_array(this->buffer_, this->get_buffer_length_());
-    this->end_data_();
-  }
+  // Copy current to previous buffer so next partial knows the screen state
+  this->command(0x26);
+  this->start_data_();
+  this->write_array(this->buffer_, this->get_buffer_length_());
+  this->end_data_();
 
   this->at_update_ = (this->at_update_ + 1) % this->full_update_every_;
-  this->wait_until_idle_();
-  ESP_LOGD(TAG, "Set the display back to deep sleep");
-  this->deep_sleep();
+  // Do NOT deep sleep — controller needs to retain buffer state for next partial
 }
 void GDEY042T81::set_full_update_every(uint32_t full_update_every) { this->full_update_every_ = full_update_every; }
 int GDEY042T81::get_width_internal() { return 400; }
